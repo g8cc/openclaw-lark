@@ -19,6 +19,7 @@ import type { DispatchContext } from './dispatch-context';
 import { buildInboundPayload } from './dispatch-builders';
 
 const log = larkLogger('inbound/dispatch-commands');
+const SYSTEM_COMMAND_SYNC_BUDGET_MS = 1200;
 
 // ---------------------------------------------------------------------------
 // Permission error notification
@@ -114,43 +115,65 @@ export async function dispatchSystemCommand(
   );
   log.info('system command detected, plain-text dispatch');
 
-  await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg: dc.accountScopedCfg,
-    dispatcherOptions: {
-      deliver: async (payload, info) => {
-        if (suppressToolDetails && info.kind === 'tool') {
-          return;
-        }
+  const runDispatch = async (): Promise<void> => {
+    await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: dc.accountScopedCfg,
+      dispatcherOptions: {
+        deliver: async (payload, info) => {
+          if (suppressToolDetails && info.kind === 'tool') {
+            return;
+          }
 
-        const text = payload.text?.trim() ?? '';
-        if (!text) return;
-        await sendMessageFeishu({
-          cfg: dc.accountScopedCfg,
-          to: dc.ctx.chatId,
-          text,
-          replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
-          accountId: dc.account.accountId,
-          replyInThread: dc.isThread,
-        });
-        delivered = true;
+          const text = payload.text?.trim() ?? '';
+          if (!text) return;
+          await sendMessageFeishu({
+            cfg: dc.accountScopedCfg,
+            to: dc.ctx.chatId,
+            text,
+            replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
+            accountId: dc.account.accountId,
+            replyInThread: dc.isThread,
+          });
+          delivered = true;
+        },
+        onSkip: (_payload, info) => {
+          if (info.reason !== 'silent') {
+            dc.log(`feishu[${dc.account.accountId}]: command reply skipped (reason=${info.reason})`);
+          }
+        },
+        onError: (err, info) => {
+          dc.error(`feishu[${dc.account.accountId}]: command ${info.kind} reply failed: ${String(err)}`);
+        },
       },
-      onSkip: (_payload, info) => {
-        if (info.reason !== 'silent') {
-          dc.log(`feishu[${dc.account.accountId}]: command reply skipped (reason=${info.reason})`);
-        }
-      },
-      onError: (err, info) => {
-        dc.error(`feishu[${dc.account.accountId}]: command ${info.kind} reply failed: ${String(err)}`);
-      },
-    },
-    replyOptions: {},
+      replyOptions: {},
+    });
+
+    dc.log(`feishu[${dc.account.accountId}]: system command dispatched (delivered=${delivered})`);
+    log.info(`system command dispatched (delivered=${delivered}, elapsed=${ticketElapsed()}ms)`);
+  };
+
+  const guardedDispatch = runDispatch().catch((err) => {
+    dc.error(`feishu[${dc.account.accountId}]: system command dispatch failed: ${String(err)}`);
   });
 
-  dc.log(`feishu[${dc.account.accountId}]: system command dispatched (delivered=${delivered})`);
-  log.info(`system command dispatched (delivered=${delivered}, elapsed=${ticketElapsed()}ms)`);
-}
+  if (!suppressToolDetails) {
+    await guardedDispatch;
+    return;
+  }
 
+  const completedWithinBudget = await Promise.race([
+    guardedDispatch.then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), SYSTEM_COMMAND_SYNC_BUDGET_MS)),
+  ]);
+
+  if (!completedWithinBudget) {
+    dc.log(
+      `feishu[${dc.account.accountId}]: system command detached from queue (budget_ms=${SYSTEM_COMMAND_SYNC_BUDGET_MS})`,
+    );
+    log.warn(`system command detached from queue (budget_ms=${SYSTEM_COMMAND_SYNC_BUDGET_MS})`);
+  }
+}
 function isLifecycleSessionCommand(text: string | undefined): boolean {
   if (!text) return false;
   const match = text.trim().match(/^\/([^\s@]+)/);
