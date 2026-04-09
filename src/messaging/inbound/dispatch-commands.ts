@@ -20,6 +20,7 @@ import { buildInboundPayload } from './dispatch-builders';
 
 const log = larkLogger('inbound/dispatch-commands');
 const SYSTEM_COMMAND_SYNC_BUDGET_MS = 1200;
+const SYSTEM_COMMAND_BACKGROUND_HARD_TIMEOUT_MS = 8000;
 
 // ---------------------------------------------------------------------------
 // Permission error notification
@@ -108,7 +109,11 @@ export async function dispatchSystemCommand(
   replyToMessageId?: string,
 ): Promise<void> {
   let delivered = false;
+  let settled = false;
+  let hardTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
   const suppressToolDetails = isLifecycleSessionCommand(dc.ctx.content);
+  const abortController = suppressToolDetails ? new AbortController() : undefined;
 
   dc.log(
     `feishu[${dc.account.accountId}]: detected system command, using plain-text dispatch`,
@@ -146,16 +151,39 @@ export async function dispatchSystemCommand(
           dc.error(`feishu[${dc.account.accountId}]: command ${info.kind} reply failed: ${String(err)}`);
         },
       },
-      replyOptions: {},
+      replyOptions: abortController ? { abortSignal: abortController.signal } : {},
     });
 
     dc.log(`feishu[${dc.account.accountId}]: system command dispatched (delivered=${delivered})`);
     log.info(`system command dispatched (delivered=${delivered}, elapsed=${ticketElapsed()}ms)`);
   };
 
-  const guardedDispatch = runDispatch().catch((err) => {
-    dc.error(`feishu[${dc.account.accountId}]: system command dispatch failed: ${String(err)}`);
-  });
+  if (abortController) {
+    hardTimeoutTimer = setTimeout(() => {
+      if (settled) return;
+      abortController.abort();
+      dc.log(
+        `feishu[${dc.account.accountId}]: system command background hard-timeout abort (timeout_ms=${SYSTEM_COMMAND_BACKGROUND_HARD_TIMEOUT_MS})`,
+      );
+      log.warn(
+        `system command background hard-timeout abort (timeout_ms=${SYSTEM_COMMAND_BACKGROUND_HARD_TIMEOUT_MS})`,
+      );
+    }, SYSTEM_COMMAND_BACKGROUND_HARD_TIMEOUT_MS);
+  }
+
+  const guardedDispatch = runDispatch()
+    .catch((err) => {
+      if (isLikelyAbortError(err)) {
+        dc.log(`feishu[${dc.account.accountId}]: system command dispatch aborted`);
+        log.warn('system command dispatch aborted');
+        return;
+      }
+      dc.error(`feishu[${dc.account.accountId}]: system command dispatch failed: ${String(err)}`);
+    })
+    .finally(() => {
+      settled = true;
+      if (hardTimeoutTimer) clearTimeout(hardTimeoutTimer);
+    });
 
   if (!suppressToolDetails) {
     await guardedDispatch;
@@ -174,10 +202,21 @@ export async function dispatchSystemCommand(
     log.warn(`system command detached from queue (budget_ms=${SYSTEM_COMMAND_SYNC_BUDGET_MS})`);
   }
 }
+
 function isLifecycleSessionCommand(text: string | undefined): boolean {
   if (!text) return false;
   const match = text.trim().match(/^\/([^\s@]+)/);
   if (!match) return false;
   const command = match[1]?.toLowerCase();
   return command === 'new' || command === 'reset';
+}
+
+function isLikelyAbortError(err: unknown): boolean {
+  if (err instanceof Error) {
+    const name = err.name.toLowerCase();
+    const msg = err.message.toLowerCase();
+    return name.includes('abort') || msg.includes('abort');
+  }
+  const text = String(err).toLowerCase();
+  return text.includes('abort');
 }
