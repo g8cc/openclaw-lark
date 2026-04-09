@@ -20,7 +20,7 @@ import { buildInboundPayload } from './dispatch-builders';
 
 const log = larkLogger('inbound/dispatch-commands');
 const SYSTEM_COMMAND_SYNC_BUDGET_MS = 1200;
-const SYSTEM_COMMAND_BACKGROUND_HARD_TIMEOUT_MS = 8000;
+const SYSTEM_COMMAND_BACKGROUND_HARD_TIMEOUT_MS = 2000;
 
 // ---------------------------------------------------------------------------
 // Permission error notification
