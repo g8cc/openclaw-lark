@@ -120,6 +120,29 @@ export async function dispatchSystemCommand(
   );
   log.info('system command detected, plain-text dispatch');
 
+  // FAST-PATH: Intercept /new or /reset command and return immediately
+  // This avoids ~28s overhead from plugin re-initialization, session context save, and compaction
+  if (suppressToolDetails) {
+    const modelName = extractModelName(dc);
+    const quickResponse = `✅ New session started · model: ${modelName || 'default'}`;
+    try {
+      await sendMessageFeishu({
+        cfg: dc.accountScopedCfg,
+        to: dc.ctx.chatId,
+        text: quickResponse,
+        replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
+        accountId: dc.account.accountId,
+        replyInThread: dc.isThread,
+      });
+      dc.log(`feishu[${dc.account.accountId}]: /new fast-path response sent (${quickResponse})`);
+      log.info(`/new fast-path: sent "${quickResponse}" in ${ticketElapsed()}ms`);
+      return; // Skip ALL OpenClaw processing
+    } catch (err) {
+      dc.log(`feishu[${dc.account.accountId}]: /new fast-path failed, falling back to normal dispatch: ${String(err)}`);
+      // Fall through to normal dispatch
+    }
+  }
+
   const runDispatch = async (): Promise<void> => {
     await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: ctxPayload,
@@ -209,6 +232,23 @@ function isLifecycleSessionCommand(text: string | undefined): boolean {
   if (!match) return false;
   const command = match[1]?.toLowerCase();
   return command === 'new' || command === 'reset';
+}
+
+function extractModelName(dc: DispatchContext): string | null {
+  try {
+    // Try to get model from route config (agent's configured model)
+    const route = dc?.route;
+    if (route?.model) return route.model;
+    if (route?.provider && route?.modelId) return `${route.provider}/${route.modelId}`;
+
+    // Fallback: check account config
+    const account = dc?.account;
+    if (account?.defaultModel) return account.defaultModel;
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function isLikelyAbortError(err: unknown): boolean {
