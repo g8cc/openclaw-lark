@@ -56,6 +56,11 @@ function isEventOwnershipValid(ctx: MonitorContext, data: unknown): boolean {
   return true;
 }
 
+function isLifecycleSessionCommandText(text: string | undefined): boolean {
+  if (!text) return false;
+  return /^\/(?:new|reset)\b/i.test(text.trim());
+}
+
 // ---------------------------------------------------------------------------
 // Message handler
 // ---------------------------------------------------------------------------
@@ -90,15 +95,18 @@ export async function handleMessageEvent(ctx: MonitorContext, data: unknown): Pr
     // (before the message enters the serial queue) so the streaming
     // card is terminated without waiting for the current task.
     const abortText = extractRawTextFromEvent(event);
-    if (abortText && isLikelyAbortText(abortText)) {
+    const isAbortCommand = Boolean(abortText && isLikelyAbortText(abortText));
+    const isLifecycleCommand = Boolean(abortText && isLifecycleSessionCommandText(abortText));
+    if (isAbortCommand || isLifecycleCommand) {
       const queueKey = buildQueueKey(accountId, chatId, threadId);
       if (hasActiveTask(queueKey)) {
         const active = getActiveDispatcher(queueKey);
         if (active) {
-          log(`feishu[${accountId}]: abort fast-path triggered for chat ${chatId} (text="${abortText}")`);
+          const trigger = isAbortCommand ? 'abort' : 'lifecycle';
+          log(`feishu[${accountId}]: ${trigger} fast-path triggered for chat ${chatId} (text="${abortText}")`);
           active.abortController?.abort();
           active.abortCard().catch((err) => {
-            error(`feishu[${accountId}]: abort fast-path abortCard failed: ${String(err)}`);
+            error(`feishu[${accountId}]: ${trigger} fast-path abortCard failed: ${String(err)}`);
           });
         }
       }

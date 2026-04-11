@@ -121,11 +121,12 @@ export async function dispatchSystemCommand(
   log.info('system command detected, plain-text dispatch');
 
   // FAST-PATH: Intercept /new or /reset command and return immediately
-  // This avoids ~28s overhead from plugin re-initialization, session context save, and compaction
+  // This avoids ~28s overhead from plugin re-initialization and compaction queue
   if (suppressToolDetails) {
     const modelName = extractModelName(dc);
     const quickResponse = `✅ New session started · model: ${modelName || 'default'}`;
     try {
+      // Send quick response immediately (<1s)
       await sendMessageFeishu({
         cfg: dc.accountScopedCfg,
         to: dc.ctx.chatId,
@@ -136,7 +137,32 @@ export async function dispatchSystemCommand(
       });
       dc.log(`feishu[${dc.account.accountId}]: /new fast-path response sent (${quickResponse})`);
       log.info(`/new fast-path: sent "${quickResponse}" in ${ticketElapsed()}ms`);
-      return; // Skip ALL OpenClaw processing
+
+      // Async: trigger session context save and plugin initialization in background
+      // This ensures session memory and compaction boundary are still created
+      setImmediate(async () => {
+        try {
+          await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg: dc.accountScopedCfg,
+            dispatcherOptions: {
+              deliver: async () => {
+                // Skip message delivery, we only need hooks to run
+              },
+              onSkip: () => {},
+              onError: (err) => {
+                dc.log(`feishu[${dc.account.accountId}]: /new async background dispatch error: ${String(err)}`);
+              },
+            },
+            replyOptions: abortController ? { abortSignal: abortController.signal } : {},
+          });
+          dc.log(`feishu[${dc.account.accountId}]: /new async background session context saved`);
+        } catch (err) {
+          dc.log(`feishu[${dc.account.accountId}]: /new async background dispatch failed: ${String(err)}`);
+        }
+      });
+
+      return; // Return immediately to user
     } catch (err) {
       dc.log(`feishu[${dc.account.accountId}]: /new fast-path failed, falling back to normal dispatch: ${String(err)}`);
       // Fall through to normal dispatch
@@ -236,14 +262,22 @@ function isLifecycleSessionCommand(text: string | undefined): boolean {
 
 function extractModelName(dc: DispatchContext): string | null {
   try {
-    // Try to get model from route config (agent's configured model)
-    const route = dc?.route;
-    if (route?.model) return route.model;
-    if (route?.provider && route?.modelId) return `${route.provider}/${route.modelId}`;
+    // Get agent ID from route
+    const agentId = dc?.route?.agentId;
+    if (!agentId) return null;
 
-    // Fallback: check account config
-    const account = dc?.account;
-    if (account?.defaultModel) return account.defaultModel;
+    // Look up agent config from accountScopedCfg
+    const cfg = dc?.accountScopedCfg;
+    const agents = cfg?.agents?.list;
+    if (!agents || !Array.isArray(agents)) return null;
+
+    const agent = agents.find((a: any) => a?.id === agentId);
+    if (!agent) return null;
+
+    // Extract model from agent config
+    const model = agent?.model;
+    if (model?.primary) return model.primary;
+    if (typeof model === 'string') return model;
 
     return null;
   } catch {
